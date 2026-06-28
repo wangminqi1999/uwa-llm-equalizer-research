@@ -1,0 +1,341 @@
+function w = noisegen(input_size, fs, varargin)
+% NOISEGEN Generate underwater acoustic noise.
+%
+% W = NOISEGEN(INPUT_SIZE, FS) generates independent pink Gaussian
+% noise with 17 dB / decade power spectrum, W. INPUT_SIZE specifies the
+% size of the input signal, and FS is the sampling rate of the input signal.
+% The noise is assumed to be spatially independent.
+%
+% W = NOISEGEN(INPUT_SIZE, FS, ARRAY_INDEX, NOISE) generates acoustic
+% noise using the mixing-coefficient method. The noise struct determines
+% the distribution:
+%   alpha == 2  => Gaussian (stabrnd reduces to Box-Muller).
+%   alpha <  2  => Symmetric alpha-stable (impulsive).
+%
+% The NOISE struct contains the following fields:
+%   Fs        - Sampling rate at which noise statistics were measured [Hz].
+%   R         - Signal bandwidth [Hz].
+%   alpha     - Stability index of the S-alpha-S distribution (2 = Gaussian).
+%   beta      - Mixing coefficients, size [M x M x K].
+%   fc        - Center frequency [Hz].
+%   rms_power - Per-channel RMS (std) of the unscaled mixed+bandpassed noise,
+%               size [M x 1]. Generation divides by this so each output
+%               channel has unit power and the summed power equals M.
+%   version   - Noise struct version (>= 1.0).
+%
+% ARRAY_INDEX specifies the indices of the receiver elements through which
+% the user would like to generate noise. These indices must match those
+% used in the REPLAY function.
+%
+% Inputs:
+%    input_size              - Input signal matrix size.
+%    fs                      - Sampling rate of the input signal in Hz.
+%    array_index             - Indices of the channels.
+%    noise                   - Struct containing noise statistics.
+%
+% Outputs:
+%    w                       - Generated noise.
+%
+% Example:
+%    See example_replay.m
+%
+%
+% Other m-files required: None
+% Subfunctions: validate_inputs, noise_pink, noise_mixing, stabrnd
+% Toolbox required: Signal Processing Toolbox (R) (resample, bandpass).
+% MAT-files optional: noise matfile.
+%
+% See also: replay.m
+%
+% Authors: Zhengnan Li, Diego A. Cuji, and Mandar Chitre
+%
+% Emails: uwa-channels@ofdm.link, cujidutan.d@northeastern.edu, mandar@nus.edu.sg
+% License: MIT
+%
+% Revision history:
+%   - Apr. 1, 2025: Initial release.
+%   - Mar. 9, 2026: Unified noise struct (alpha, beta, Fs, R, fc,
+%                    rms_power, version). Removed Cholesky (sigma/h)
+%                    path in favor of mixing-coefficient method.
+%
+
+
+if nargin ~= 2
+  array_index = varargin{1};
+  noise = varargin{2};
+  validate_inputs(input_size, noise, array_index);
+end
+
+
+if nargin == 2
+  w = noise_pink(input_size, fs);
+elseif nargin == 4
+  %% Mixing-coefficient generation (Gaussian or impulsive)
+  w = noise_mixing(input_size, fs, noise, array_index);
+
+  %% Per-channel RMS power normalization
+  if isfield(noise, 'rms_power')
+    w = w ./ noise.rms_power(array_index).';
+  end
+
+  %% Bandpass filtering
+  fl = noise.fc - noise.R/2*1.01;
+  fh = noise.fc + noise.R/2*1.01;
+  w = bandpass(w, [fl, fh], fs, "steepness", 0.96);
+else
+  error('Wrong noise option.');
+end
+end
+
+
+function validate_inputs(input_size, noise, array_index)
+% Validate the noise struct and array indices.
+assert(noise.version >= 1.0, ...
+  'The minimum version of the noise matrix is 1.0, and you have %.1f.', ...
+  noise.version);
+
+M = size(noise.beta, 1);
+
+assert(length(unique(array_index)) == length(array_index), ...
+  'array_index must contain unique entries.');
+assert(input_size(2) == length(array_index), ...
+  'input_size(2) (%d) must equal length(array_index) (%d).', ...
+  input_size(2), length(array_index));
+assert(max(array_index) <= M, ...
+  'The largest receive channel array_index, %d, should be less than %d.', ...
+  max(array_index), M);
+end
+
+
+function w = noise_pink(input_size, fs)
+% Generate textbook style noise: independent pink Gaussian noise (17 dB per decade) across array elements. Each channel has unit expected power, so the summed power over channels equals the channel count.
+nfft = 4096;
+fmin = 0;
+fmax = fs/2;
+f = linspace(fs/2/nfft, fs/2, nfft);
+H_dB = -17 * log10(f/1e3);
+H_oneside = 10.^(H_dB / 10);
+H_oneside(1:floor(fmin/(fs / 2 / nfft))) = 0;
+H_oneside(ceil(fmax/(fs / 2 / nfft)):end) = 0;
+H = sqrt([H_oneside, flip(H_oneside(2:end))]);
+h = fftshift(ifft(H));
+h = h / sqrt(sum(h.^2));
+w = randn(input_size);
+for m = 1:input_size(2)
+  w(:, m) = conv(w(:, m), h, 'same');
+end
+end
+
+
+function w = noise_mixing(input_size, fs, noise, array_index)
+% Generate noise via mixing coefficients.
+%   alpha == 2: Gaussian (stabrnd Box-Muller path).
+%   alpha <  2: Symmetric alpha-stable (impulsive).
+%
+% Time-domain mixing:
+%   w(n, i) = sum_j sum_k beta(i, j, k) * z(n+k-1, j)
+% One BLAS matmul per tap k, restricted to the requested output rows.
+alpha = noise.alpha;
+beta = noise.beta;
+Fs = noise.Fs;
+
+[p, q] = rat(fs/Fs);
+signal_size = input_size;
+signal_size(1) = ceil(signal_size(1)*q/p);
+
+K = signal_size(1);
+M = size(beta, 1);
+K_mix = size(beta, 3);
+
+z = stabrnd(alpha, 0, 1, 0, K + K_mix, M);
+
+beta_sub = beta(array_index, :, :);   % Nout x M x K_mix
+
+w = zeros(K, length(array_index));
+for k = 1:K_mix
+  w = w + z(k:k+K-1, :) * beta_sub(:, :, k).';
+end
+
+w = resample(w, p, q, 'Dimension', 1);
+w = w(1:input_size(1), :);
+end
+
+function x = stabrnd(alpha, beta, c, delta, m, n)
+
+% STABRND Stable Random Number Generator
+% (McCulloch 12/18/96)
+%
+% x = stabrnd(alpha,beta,c,delta,m,n);
+%
+% alpha, beta, c and delta are the characteristic exponent,
+%   symmetry paramter, scale parameter (dispersion^1/alpha) and
+%   location parameter respectively.
+%
+% Returns m x n matrix of iid stable random numbers with
+%   characteristic exponent alpha in [.1,2], skewness parameter
+%   beta in [-1,1], scale c > 0, and location parameter delta.
+%
+% Based on the method of J.M. Chambers, C.L. Mallows and B.W.
+%   Stuck, "A Method for Simulating Stable Random Variables,"
+%   JASA 71 (1976): 340-4.
+%
+% Encoded in MATLAB by J. Huston McCulloch, Ohio State
+%   University Econ. Dept. (mcculloch.2@osu.edu).  This 12/18/96
+%   version uses 2*m*n calls to RAND, and does not rely on
+%   the STATISTICS toolbox.
+
+% The CMS method is applied in such a way that x will have the
+%   log characteristic function
+%        log E exp(ixt) = i*delta*t + psi(c*t),
+%   where
+%     psi(t) = -abs(t)^alpha*(1-i*beta*sign(t)*tan(pi*alpha/2))
+%                              for alpha ~= 1,
+%            = -abs(t)*(1+i*beta*(2/pi)*sign(t)*log(abs(t))),
+%                              for alpha = 1.
+%
+% With this parameterization, the stable cdf S(x; alpha, beta,
+%   c, delta) equals S((x-delta)/c; alpha, beta, 1, 0).  See my
+%   "On the parametrization of the afocal stable distributions,"
+%   _Bull. London Math. Soc._ 28 (1996): 651-55, for details.
+%
+% When alpha = 2, the distribution is Gaussian with mean delta
+%   and variance 2*c^2, and beta has no effect.
+%
+% When alpha > 1, the mean is delta for all beta.  When alpha
+%   <= 1, the mean is undefined.
+%
+% When beta = 0, the distribution is symmetrical and delta is
+%   the median for all alpha.  When alpha = 1 and beta = 0, the
+%   distribution is Cauchy (arctangent) with median delta.
+%
+% When the submitted alpha is > 2 or < .1, or beta is outside
+%   [-1,1], an error message is generated and x is returned as a
+%   matrix of NaNs.
+%
+% Alpha < .1 is not allowed here because of the non-negligible
+%   probability of overflows.
+%
+% If you're only interested in the symmetric cases, you may just
+%   set beta = 0 and skip the following considerations:
+%
+% When beta > 0 (< 0), the distribution is skewed to the right
+%   (left).
+%
+% When alpha < 1, delta, as defined above, is the unique fractile
+%   that is invariant under averaging of iid contributions.  I
+%   call such a fractile a "focus of stability."  This, like the
+%   mean, is a natural location parameter.
+%
+% When alpha = 1, either every fractile is a focus of stability,
+%   as in the beta = 0 Cauchy case, or else there is no focus of
+%   stability at all, as is the case for beta ~=0.  In the latter
+%   cases, which I call "afocal," delta is just an arbitrary
+%   fractile that has a simple relation to the c.f.
+%
+% When alpha > 1 and beta > 0, med(x) must lie very far below
+%   the mean as alpha approaches 1 from above.  Furthermore, as
+%   alpha approaches 1 from below, med(x) must lie very far above
+%   the focus of stability when beta > 0.  If beta ~= 0, there
+%   is therefore a discontinuity in the distribution as a function
+%   of alpha as alpha passes 1, when delta is held constant.
+%
+% CMS, following an insight of Vladimir Zolotarev, remove this
+%   discontinuity by subtracting
+%          beta*c*tan(pi*alpha/2)
+%   (equivalent to their -tan(alpha*phi0)) from x for alpha ~=1
+%   in their program RSTAB, a.k.a. RNSTA in IMSL (formerly GGSTA).
+%   The result is a random number whose distribution is a contin-
+%   uous function of alpha, but whose location parameter (which I
+%   call zeta) is a shifted version of delta that has no known
+%   interpretation other than computational convenience.
+%   The present program restores the more meaningful "delta"
+%   parameterization by using the CMS (4.1), but with
+%   beta*c*tan(pi*alpha/2) added back in (ie with their initial
+%   tan(alpha*phi0) deleted).  RNSTA therefore gives different
+%   results than the present program when beta ~= 0.  However,
+%   the present beta is equivalent to the CMS beta' (BPRIME).
+%
+% Rather than using the CMS D2 and exp2 functions to compensate
+%   for the ill-condition of the CMS (4.1) when alpha is very
+%   near 1, the present program merely fudges these cases by
+%   computing x from their (2.4) and adjusting for
+%   beta*c*tan(pi*alpha/2) when alpha is within 1.e-8 of 1.
+%   This should make no difference for simulation results with
+%   samples of size less than approximately 10^8, and then
+%   only when the desired alpha is within 1.e-8 of 1, but not
+%   equal to 1.
+%
+% The frequently used Gaussian and symmetric cases are coded
+%   separately so as to speed up execution.
+%
+% Additional references:
+% V.M. Zolotarev, _One Dimensional Stable Laws_, Amer. Math.
+%   Soc., 1986.
+% G. Samorodnitsky and M.S. Taqqu, _Stable Non-Gaussian Random
+%   Processes_, Chapman & Hill, 1994.
+% A. Janicki and A. Weron, _Simulaton and Chaotic Behavior of
+%   Alpha-Stable Stochastic Processes_, Dekker, 1994.
+% J.H. McCulloch, "Financial Applications of Stable Distributons,"
+%   _Handbook of Statistics_ Vol. 14, forthcoming early 1997.
+
+% Errortraps:
+if alpha < .1 | alpha > 2
+  disp('Alpha must be in [.1,2] for function STABRND.')
+  alpha
+  x = NaN * zeros(m, n);
+  return
+end
+if abs(beta) > 1
+  disp('Beta must be in [-1,1] for function STABRND.')
+  beta
+  x = NaN * zeros(m, n);
+  return
+end
+
+% Generate exponential w and uniform phi:
+w = -log(rand(m, n));
+phi = (rand(m, n) - .5) * pi;
+
+% Gaussian case (Box-Muller):
+if alpha == 2
+  x = (2 * sqrt(w) .* sin(phi));
+  x = delta + c * x;
+  return
+end
+
+% Symmetrical cases:
+if beta == 0
+  if alpha == 1 % Cauchy case
+    x = tan(phi);
+  else
+    x = ((cos((1 - alpha)*phi) ./ w).^(1 / alpha - 1) ...
+      .* sin(alpha * phi) ./ cos(phi).^(1 / alpha));
+  end
+
+  % General cases:
+else
+  cosphi = cos(phi);
+  if abs(alpha-1) > 1.e-8
+    zeta = beta * tan(pi*alpha/2);
+    aphi = alpha * phi;
+    a1phi = (1 - alpha) * phi;
+    x = ((sin(aphi) + zeta * cos(aphi)) ./ cosphi) ...
+      .* ((cos(a1phi) + zeta * sin(a1phi)) ...
+      ./ (w .* cosphi)).^((1 - alpha) / alpha);
+  else
+    bphi = (pi / 2) + beta * phi;
+    x = (2 / pi) * (bphi .* tan(phi) - beta * log((pi / 2)*w ...
+      .*cosphi./bphi));
+    if alpha ~= 1
+      x = x + beta * tan(pi * alpha/2);
+    end
+  end
+end
+
+% Finale:
+x = delta + c * x;
+return
+% End of STABRND.M
+end
+
+% [EOF]
