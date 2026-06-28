@@ -1,0 +1,47 @@
+# Python caches and environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE and editor state
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# MATLAB temporary files
+*.asv
+*.m~
+
+# Training and experiment outputs
+runs/
+outputs/
+logs/
+wandb/
+tensorboard/
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+
+# Local secrets
+.env
+.env.*
+*.pem
+*.key

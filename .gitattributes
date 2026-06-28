@@ -1,0 +1,10 @@
+* text=auto
+
+*.pdf binary
+*.mat binary
+*.h5 binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.mex binary
+*.mexa64 binary
