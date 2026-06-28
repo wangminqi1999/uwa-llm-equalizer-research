@@ -45,3 +45,7 @@ checkpoints/
 .env.*
 *.pem
 *.key
+
+# Local upload helpers
+.upload-keys/
+.upload-work/
